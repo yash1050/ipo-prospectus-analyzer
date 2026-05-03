@@ -1,0 +1,5 @@
+.env
+data/
+__pycache__/
+*.py[cod]
+.tmp_pymupdf_check/

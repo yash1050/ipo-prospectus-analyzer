@@ -1,0 +1,9 @@
+langchain
+langchain-community
+langchain-openai
+langchain-qdrant
+langchain-text-splitters
+pymupdf
+qdrant-client
+python-dotenv
+streamlit
