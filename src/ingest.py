@@ -1,110 +1,154 @@
+"""
+Multi-company PDF ingestion: chunk, embed, and upload each prospectus to its own Qdrant collection.
+"""
+
+from __future__ import annotations
+
 import os
+import sys
+import time
 from pathlib import Path
-from typing import List
-
-import fitz
-from dotenv import load_dotenv
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
-from langchain_qdrant import QdrantVectorStore
-
+from typing import Any
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
-PDF_PATH = PROJECT_ROOT / "data" / "s1a_instacart.pdf"
-COLLECTION_NAME = "instacart_s1a_lc"
+
+if __package__:
+    from .financials import COMPANIES
+else:
+    if str(BASE_DIR) not in sys.path:
+        sys.path.insert(0, str(BASE_DIR))
+    from financials import COMPANIES
+
+import fitz
+from dotenv import load_dotenv
+from langchain_core.documents import Document
+from langchain_openai import OpenAIEmbeddings
+from langchain_qdrant import QdrantVectorStore
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from qdrant_client import QdrantClient
+
 EMBEDDING_MODEL = "text-embedding-3-small"
 MIN_PAGE_CHARS = 100
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 50
+DELAY_SECONDS = 2
 
 
-def require_env_var(name: str) -> str:
+def _require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
         raise ValueError(f"Missing required environment variable: {name}")
     return value
 
 
-def extract_pdf_pages_to_documents(pdf_path: Path) -> List[Document]:
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF not found at path: {pdf_path}")
+def ingest_company(company: dict[str, Any], embeddings: OpenAIEmbeddings) -> int:
+    """
+    Ingest one company's PDF into Qdrant collection ipo_{name}.
+    Returns number of chunks uploaded.
+    """
+    load_dotenv(PROJECT_ROOT / ".env")
 
+    name = str(company["name"])
+    ticker = str(company.get("ticker", ""))
+    pdf_rel = str(company["pdf"])
+    collection_name = f"ipo_{name}"
+
+    qdrant_url = _require_env("QDRANT_URL")
+    qdrant_api_key = _require_env("QDRANT_API_KEY")
+
+    pdf_path = Path(pdf_rel)
+    if not pdf_path.is_absolute():
+        pdf_path = PROJECT_ROOT / pdf_path
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+    existing = {c.name for c in client.get_collections().collections}
+    if collection_name in existing:
+        client.delete_collection(collection_name=collection_name)
+        print(f"🗑️ Deleted existing collection: {name}")
+
+    documents: list[Document] = []
     doc = fitz.open(pdf_path)
-    extracted_documents: List[Document] = []
     try:
-        for i, page in enumerate(doc):
+        for i in range(len(doc)):
+            page = doc[i]
             text = page.get_text("text").strip()
             if len(text) < MIN_PAGE_CHARS:
                 continue
-            extracted_documents.append(
+            documents.append(
                 Document(
                     page_content=text,
                     metadata={
+                        "company": name,
+                        "ticker": ticker,
                         "page_number": i + 1,
-                        "source": str(pdf_path),
+                        "source": str(pdf_path.resolve()),
                     },
                 )
             )
     finally:
         doc.close()
 
-    return extracted_documents
-
-
-def split_documents(documents: List[Document]) -> List[Document]:
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
         length_function=len,
     )
-    return splitter.split_documents(documents)
+    chunks = splitter.split_documents(documents)
 
+    print(f"📄 {name}: {len(chunks)} chunks created → uploading...")
 
-def upload_documents_to_qdrant(documents: List[Document], qdrant_url: str, qdrant_api_key: str) -> QdrantVectorStore:
-    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
-    return QdrantVectorStore.from_documents(
-        documents=documents,
+    if not chunks:
+        return 0
+
+    QdrantVectorStore.from_documents(
+        documents=chunks,
         embedding=embeddings,
         url=qdrant_url,
         api_key=qdrant_api_key,
-        collection_name=COLLECTION_NAME,
+        collection_name=collection_name,
     )
-
-
-def verify_retrieval(vector_store: QdrantVectorStore) -> None:
-    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
-    query = "What is Instacart's primary revenue stream?"
-    results = retriever.invoke(query)
-
-    print("\nTop 3 retrieved chunks:")
-    for index, doc in enumerate(results, start=1):
-        page_number = doc.metadata.get("page_number", "N/A")
-        preview = doc.page_content[:200].replace("\n", " ").strip()
-        print(f"{index}. Page {page_number}: {preview}")
+    return len(chunks)
 
 
 def main() -> None:
-    load_dotenv()
-    os.environ["OPENAI_API_KEY"] = require_env_var("OPENAI_API_KEY")
-    qdrant_url = require_env_var("QDRANT_URL")
-    qdrant_api_key = require_env_var("QDRANT_API_KEY")
+    load_dotenv(PROJECT_ROOT / ".env")
+    _require_env("OPENAI_API_KEY")
 
-    print("Extracting PDF text...")
-    documents = extract_pdf_pages_to_documents(PDF_PATH)
-    print(f"Extracted usable pages: {len(documents)}")
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
 
-    print("Chunking text...")
-    chunks = split_documents(documents)
-    print(f"Total chunks created: {len(chunks)}")
+    chunks_by_company: dict[str, int] = {}
+    failures = 0
 
-    if not chunks:
-        raise RuntimeError("No chunks were created. Check PDF extraction and filtering thresholds.")
+    for index, company in enumerate(COMPANIES):
+        label = company.get("name", str(company))
+        try:
+            n = ingest_company(company, embeddings)
+            chunks_by_company[label] = n
+            print(f"✅ {label}: {n} chunks uploaded to ipo_{label}")
+        except Exception as exc:
+            failures += 1
+            chunks_by_company[label] = 0
+            print(f"❌ Failed: {label} — {exc}")
 
-    print("Uploading chunks to Qdrant...")
-    vector_store = upload_documents_to_qdrant(chunks, qdrant_url, qdrant_api_key)
+        if index < len(COMPANIES) - 1:
+            time.sleep(DELAY_SECONDS)
 
-    print("Running retrieval verification...")
-    verify_retrieval(vector_store)
+    successful = sum(1 for c in chunks_by_company.values() if c > 0)
+    total_chunks = sum(chunks_by_company.values())
+
+    print("\n" + "=" * 60)
+    print("Summary")
+    print("=" * 60)
+    print(f"Total companies ingested (with ≥1 chunk): {successful} / {len(COMPANIES)}")
+    if failures:
+        print(f"Failures: {failures}")
+    print("Chunks per company:")
+    for co_name, count in chunks_by_company.items():
+        print(f"  {co_name}: {count}")
+    print(f"Total chunks across all companies: {total_chunks}")
 
 
 if __name__ == "__main__":

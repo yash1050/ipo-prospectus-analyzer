@@ -3,7 +3,11 @@ langchain-community
 langchain-openai
 langchain-qdrant
 langchain-text-splitters
+pdfplumber
 pymupdf
 qdrant-client
 python-dotenv
+requests
 streamlit
+yfinance
+plotly
